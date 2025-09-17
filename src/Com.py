@@ -1,4 +1,4 @@
-from threading import Lock
+from threading import Lock, Event
 from queue import Queue, Empty
 
 from pyeventbus3.pyeventbus3 import PyBus
@@ -93,4 +93,41 @@ class Com:
       return self._mailbox.get_nowait()
     except Empty:
       return None
-    
+  
+  # --------------------------------------------------------------
+  # Broadcast Synchrone
+  # --------------------------------------------------------------
+
+  # Broadcast synchrone (barrière) : envoi un message de type 'SYNC' et attend que tous les autres aient fait de même
+  def broadcastSync(self, payload, from_id: int, my_id: int, npProcess: int):
+
+    # Cas 1 : je suis l'emetteur
+    if from_id == my_id:
+      send_clock = self.incrementClock()
+      bm = BroadcastMessage({"type": "SYNC-BROADCAST", "data": payload}, send_clock, self.owner_name)
+      print(f"[{self.owner_name}][COM-SYNC-BROADCAST] msg={payload} msgClock={send_clock} -> envoi à tous")
+      PyBus.Instance().post(bm)
+
+      # J'attends que tous les autres aient fait de même
+      ack_event = Event()
+      self._acks_received = 0
+      self._acks_target = npProcess - 1  # tous sauf moi
+      self._acks_event = ack_event
+
+      # Bloque jusqu'à réception de tous les ACK
+      while not ack_event.wait(timeout=0.1):
+        pass
+      print(f"[{self.owner_name}][COM-SYNC-BROADCAST] Tous les ACK reçus, barrière franchie")
+  
+  # Incrémente le compteur d'ACK reçus et débloque si tous reçus
+  def handle_ack(self):
+    if hasattr(self, '_acks_received'):
+      self._acks_received += 1
+      if self._acks_received >= self._acks_target:
+        self._acks_event.set()
+        # Nettoyage des variables temporaires
+        del self._acks_received
+        del self._acks_target
+        del self._acks_event
+
+

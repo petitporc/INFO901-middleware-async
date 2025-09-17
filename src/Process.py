@@ -161,6 +161,15 @@ class Process(Thread):
                 if count >= self.npProcess:
                     self.sync_event.set()
             return
+        
+        # Mettre les SYNC-BROADCAST dans la mailbox
+        if isinstance(payload, dict) and payload.get("type") == "SYNC-BROADCAST":
+            print(f"[{self.getName()}][COM-SYNC-BROADCAST-RECV] from={event.getSender()} msg={payload['data']}")
+            # J'envoie un ACK à l'émetteur
+            ack = MessageTo({"type": "ACK-SYNC"}, self.incrementClock(), self.myProcessName, 0) # to=0 car l'émetteur est P0
+            print(f"[{self.getName()}][COM-SYNC-ACK-SEND] envoi ACK vers P0")
+            PyBus.Instance().post(ack)
+            return # pas de mise en boîte aux lettres
 
         # Sinon traitement normal
         print(f"[{self.getName()}][RECV-BROADCAST] from={event.getSender()} msg={event.getPayload()} msgClock={event.getClock()} -> localClock={updated} (thread={threading.current_thread().name})")
@@ -171,8 +180,18 @@ class Process(Thread):
         # Seul le destinataire traite le message
         if event.getTo() != self.myId:
             return
+        
+        # Vérification du type payload
+        payload = event.getPayload()
+        if isinstance(payload, dict) and payload.get("type") == "ACK-SYNC":
+            # c'est un ACK de synchro -> passe par le communicateur
+            print(f"[{self.getName()}][SYNC-ACK-RECV] de {event.getSender()}")
+            self.com.handle_ack()
+            return # pas de mise en boîte aux lettres
+        
+        # Traitement normal
         updated = self.updateClockOnReceive(event.getClock())
-        print(f"[{self.getName()}][RECV-TO] from={event.getSender()} to={event.getTo()} msg={event.getPayload()} msgClock={event.getClock()} -> localClock={updated} (thread={threading.current_thread().name})")
+        print(f"[{self.getName()}][RECV-TO] from={event.getSender()} to={event.getTo()} msg={payload} msgClock={event.getClock()} -> localClock={updated} (thread={threading.current_thread().name})")
         self.com.enqueue_incoming(event)
 
     @subscribe(threadMode = Mode.PARALLEL, onEvent=TokenMessage)
@@ -203,9 +222,9 @@ class Process(Thread):
             print(f"[{self.getName()}][LOOP {loop}] localClock={local_clock}")
             sleep(1)
 
-            # Synchronisation des processus au tour 2
-            if loop == 2:
-                self.synchronize()
+            # Synchronisation des processus au tour 2 avec le middleware
+            if self.myProcessName == "P0" and loop == 2:
+                self.com.broadcastSync("Hello everyone, sync time!", from_id=0, my_id=self.myId, npProcess=self.npProcess)
 
             # Envoi de messages par P1
             if self.myProcessName == "P1":
