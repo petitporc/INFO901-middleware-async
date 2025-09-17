@@ -11,6 +11,7 @@ from Message import Message
 from BroadcastMessage import BroadcastMessage
 from MessageTo import MessageTo
 from TokenMessage import TokenMessage
+from Com import Com
 
 from pyeventbus3.pyeventbus3 import *
 
@@ -28,6 +29,7 @@ class Process(Thread):
         self.myId = Process.nbProcessCreated
         Process.nbProcessCreated +=1
         self.myProcessName = name
+        self.com = Com(self.myProcessName)
         self.setName("MainThread-" + name)
 
         PyBus.Instance().register(self, self)
@@ -63,34 +65,28 @@ class Process(Thread):
     
     # Incrément de l'horloge Lamport avec accès lock
     def incrementClock(self):
-        with self.lock:
-            self.clock += 1
-            return self.clock
+        # Délégation à Com
+        return self.com.incrementClock()
 
     # Mise à jour de l'horloge lors de la récupération
     def updateClockOnReceive(self, receivedClock):
-        with self.lock:
-            self.clock = max(self.clock, receivedClock) + 1
-            return self.clock
+        # Délégation à Com
+        return self.com.update_on_receive(receivedClock)
     
     # Accès en lecture de l'horloge
     def getClock(self):
-        with self.lock:
-            return self.clock
+        # Délégation à Com
+        return self.com.getClock()
 
     # Ajout du broadcastMessage
     def broadcast(self, payload):
-        send_clock = self.incrementClock()
-        bm = BroadcastMessage(payload, send_clock, self.myProcessName)
-        print(f"[{self.getName()}][BROADCAST] msg={bm.getPayload()} msgClock={bm.getClock()} sender={bm.getSender()}")
-        PyBus.Instance().post(bm)
+        # délégation à Com
+        self.com.broadcast(payload)
 
     # Ajout de sendTo
     def sendTo(self, payload, to):
-        send_clock = self.incrementClock()
-        mt = MessageTo(payload, send_clock, self.myProcessName, to)
-        print(f"[{self.getName()}][SEND-TO] msg={mt.getPayload()} msgClock={mt.getClock()} sender={mt.getSender()} to={mt.getTo()}")
-        PyBus.Instance().post(mt)
+        # délégation à Com
+        self.com.sendTo(payload, to)
 
     # Renvoi l'ID du voisin suivant sur l'anneau
     def nextId(self):
@@ -147,6 +143,7 @@ class Process(Thread):
     def process(self, event):
         updated = self.updateClockOnReceive(event.getClock())
         print(f"[{self.getName()}][RECV] from={event.getSender()} msg={event.getPayload()} msgClock={event.getClock()} -> localClock={updated} (thread={threading.current_thread().name})")
+        self.com.enqueue_incoming(event)
 
     @subscribe(threadMode = Mode.PARALLEL, onEvent=BroadcastMessage)
     def onBroadcast(self, event):
@@ -167,6 +164,7 @@ class Process(Thread):
 
         # Sinon traitement normal
         print(f"[{self.getName()}][RECV-BROADCAST] from={event.getSender()} msg={event.getPayload()} msgClock={event.getClock()} -> localClock={updated} (thread={threading.current_thread().name})")
+        self.com.enqueue_incoming(event)
 
     @subscribe(threadMode = Mode.PARALLEL, onEvent=MessageTo)
     def onReceive(self, event):
@@ -175,6 +173,7 @@ class Process(Thread):
             return
         updated = self.updateClockOnReceive(event.getClock())
         print(f"[{self.getName()}][RECV-TO] from={event.getSender()} to={event.getTo()} msg={event.getPayload()} msgClock={event.getClock()} -> localClock={updated} (thread={threading.current_thread().name})")
+        self.com.enqueue_incoming(event)
 
     @subscribe(threadMode = Mode.PARALLEL, onEvent=TokenMessage)
     def onToken(self, event):
@@ -217,10 +216,7 @@ class Process(Thread):
                 self.sendTo({"type": "greeting", "text": "Hello P0"}, to=0)
 
                 # Envoi de message
-                send_clock = self.incrementClock()
-                m2 = Message({"type": "greeting", "text": "bu"}, send_clock, self.myProcessName)
-                print(f"[{self.getName()}][SEND] msg={m2.getPayload()} msgClock={m2.getClock()} sender={m2.getSender()}")
-                PyBus.Instance().post(m2)
+                self.com.publish({"type": "greeting", "text": "bu"})
 
             # Demande de section critique
             # Exemple : P1 demande la SC après 3 tours
