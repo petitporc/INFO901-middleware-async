@@ -1,26 +1,13 @@
-class MessageTo:
+from MessageBase import MessageBase
+
+class MessageTo(MessageBase):
   def __init__(self, payload, clock, sender, to, payload_type=None):
-    self.payload = payload
-    self.clock = clock
-    self.sender = sender
+    super().__init__(payload, clock, sender, payload_type)
     self.to = to
-    self.payload_type = payload_type
-  
-  def getPayload(self):
-    return self.payload
-  
-  def getClock(self):
-    return self.clock
-  
-  def getSender(self):
-    return self.sender
   
   def getTo(self):
     return self.to
   
-  def getPayloadType(self):
-    return self.payload_type
-  
   def __repr__(self):
-    return f"MessageTo(payload={self.payload!r}, clock={self.clock}, sender={self.sender}, to={self.to}, type={self.payload_type})"
+    return (f"{self.__class__.__name__}(payload={self._payload!r}, " f"clock={self._clock}, sender={self._sender}, to={self.to}, type={self._payload_type})")
   
