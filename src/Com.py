@@ -193,13 +193,15 @@ class Com:
     
     payload = event.getPayload()
     if isinstance(payload, dict) and payload.get("type") == "ACK-SYNC-BROADCAST":
-      print(f"[{self.owner_name}][COM-SYNC-ACK-RECV] reçu ACK de {event.getSender()}")
-      self.handle_ack()
-      return
+      if event.getSender() != self.owner_name: # j'ignore mes propres ACK
+        print(f"[{self.owner_name}][COM-SYNC-ACK-RECV] reçu ACK de {event.getSender()}")
+        self.handle_ack()
+        return
     if isinstance(payload, dict) and payload.get("type") == "ACK-SYNC-TO":
-      print(f"[{self.owner_name}][COM-SYNC-TO-ACK-RECV] reçu ACK de {event.getSender()}")
-      self.handle_ack()
-      return
+      if event.getSender() != self.owner_name: # j'ignore mes propres ACK
+        print(f"[{self.owner_name}][COM-SYNC-TO-ACK-RECV] reçu ACK de {event.getSender()}")
+        self.handle_ack()
+        return
 
     updated = self.update_on_receive(event.getClock())
     print(f"[{self.owner_name}][COM-RECV-TO] reçu de {event.getSender()} to={event.getTo()} msg={payload} msgClock={event.getClock()} -> localClock={updated})")
@@ -362,6 +364,6 @@ class Com:
       print(f"[{self.owner_name}][TOKEN-HELD] je garde le jeton pour la SC")
     else:
       # ce processus relaye le jeton
-      if self.alive:
+      if self.alive and not self.holding_token:
         time.sleep(0.5)
         self.sendToken(self.nextId())
