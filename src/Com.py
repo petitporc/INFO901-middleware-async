@@ -18,10 +18,12 @@ class Com:
   - la mise à jour d'horloge à la reception
   - les communications synchrones (barrières et envois/recep. bloquants)
   - la section critique distribuée (token ring)
+  - la numérotation REGISTER des processus
   """
 
-  def __init__(self, owner_name: str):
+  def __init__(self, owner_name: str, npProcess: int):
     self.owner_name = owner_name
+    self.npProcess = npProcess
     self._clock = 0
     self._clock_lock = Lock()
 
@@ -35,8 +37,15 @@ class Com:
 
     # Infos sur le processus
     self.myId = None # sera fixé par le process après REGISTER
-    self.npProcess = None # sera fixé par le process après REGISTER
     self.alive = True
+
+    # Synchronisation (barrière)
+    self._sync_received = set()
+    self._sync_event = None
+
+    # REGISTER
+    self.participants = set()
+    self.register_event = Event()
 
     # Inscription au bus
     PyBus.Instance().register(self, self)
@@ -109,29 +118,142 @@ class Com:
       return self._mailbox.get_nowait()
     except Empty:
       return None
+    
+  # --------------------------------------------------------------
+  # REGISTER (numérotation des processus)
+  # --------------------------------------------------------------
+
+  # Envoi de mon REGISTER
+  def register(self):
+    # Annonce
+    self.participants = {self.owner_name}  # je me compte déjà
+    self.broadcast({"type": "REGISTER", "name": self.owner_name})
+    print(f"[{self.owner_name}][REGISTER] annoncé {self.owner_name}, attente de {self.npProcess} participants...")
+
+    # Attente des autres REGISTER
+    while len(self.participants) < self.npProcess:
+      self.register_event.wait(timeout=0.2)  # reveil périodique pour vérifier la condition
+      
+    # Calcul des IDs si tous reçus
+    sorted_names = sorted(self.participants)
+    self.myId = sorted_names.index(self.owner_name)
+    print(f"[{self.owner_name}][REGISTER] participants={sorted_names} -> myID={self.myId}")
+
+    # Démarage du token si je suis le dernier
+    if self.myId == self.npProcess - 1:
+      def _delayed_start():
+        time.sleep(0.5)  # petit délai pour laisser le temps aux autres de finir leur REGISTER
+        print(f"[{self.owner_name}][TOKEN-START] je démarre le token -> P0")
+        self.sendToken(to_id=0)
+      from threading import Thread
+      Thread(target=_delayed_start, daemon=True).start()
+    
+    return self.myId
   
+  
+  @subscribe(threadMode=Mode.PARALLEL, onEvent=BroadcastMessage)
+  def onBroadcast(self, event):
+    if event.getSender() == self.owner_name:
+      return  # j'ignore mes propres broadcasts
+    updated = self.update_on_receive(event.getClock())
+    payload = event.getPayload()
+
+    # Gestion des REGISTER
+    if isinstance(payload, dict) and payload.get("type") == "REGISTER":
+      self.participants.add(payload["name"])
+      print(f"[{self.owner_name}][REGISTER] reçu de {payload['name']} ({len(self.participants)}/{self.npProcess})")
+      if self.npProcess is not None and len(self.participants) >= self.npProcess:
+        self.register_event.set()  # reveille la boucle d'attente
+      return
+    
+    # Gestion des SYNC
+    if isinstance(payload, dict) and payload.get("type") == "SYNC":
+      self._sync_received.add(event.getSender())
+      print(f"[{self.owner_name}][COM-SYNC-RECV] reçu SYNC de {event.getSender()} ({len(self._sync_received)}/{self._sync_target})")
+      if len(self._sync_received) >= self.npProcess:
+        self._sync_event.set()  # reveille la boucle d'attente
+      return
+    
+    # Gestion des SYNC-BROADCAST
+    if isinstance(payload, dict) and payload.get("type") == "SYNC-BROADCAST":
+      print(f"[{self.owner_name}][COM-SYNC-BROADCAST-RECV] reçu SYNC-BROADCAST de {event.getSender()} -> msg={payload['data']}")
+      # Répondre par un ACK
+      ack = MessageTo({"type": "ACK-SYNC-BROADCAST"}, self.incrementClock(), self.owner_name, event.getSender())
+      PyBus.Instance().post(ack)
+      print(f"[{self.owner_name}][COM-SYNC-ACK-SEND] envoyé ACK à {event.getSender()}")
+      return
+    
+    print(f"[{self.owner_name}][COM-BROADCAST-RECV] reçu de {event.getSender()} msg={payload} msgClock={event.getClock()} -> localClock={updated})")
+    self.enqueue_incoming(event)
+
+  @subscribe(threadMode=Mode.PARALLEL, onEvent=MessageTo)
+  def onReceive(self, event):
+    if self.myId is None and event.getTo() != self.myId:
+      return
+    
+    payload = event.getPayload()
+    if isinstance(payload, dict) and payload.get("type") == "ACK-SYNC-BROADCAST":
+      print(f"[{self.owner_name}][COM-SYNC-ACK-RECV] reçu ACK de {event.getSender()}")
+      self.handle_ack()
+      return
+    if isinstance(payload, dict) and payload.get("type") == "ACK-SYNC-TO":
+      print(f"[{self.owner_name}][COM-SYNC-TO-ACK-RECV] reçu ACK de {event.getSender()}")
+      self.handle_ack()
+      return
+
+    updated = self.update_on_receive(event.getClock())
+    print(f"[{self.owner_name}][COM-RECV-TO] reçu de {event.getSender()} to={event.getTo()} msg={payload} msgClock={event.getClock()} -> localClock={updated})")
+    self.enqueue_incoming(event)
+  
+  # --------------------------------------------------------------
+  # Synchronisation (barrière générrale)
+  # --------------------------------------------------------------
+
+  # Barrière distribuée : attend que tous les processus aient appelé synchronize().
+  # Envoie un message SYNC et attend d'en recevoir un de chaque participant.
+  def synchronize(self, npProcess: int):
+    # Envoi de mon SYNC
+    send_clock = self.incrementClock()
+    bm = BroadcastMessage({"type": "SYNC"}, send_clock, self.owner_name)
+    print(f"[{self.owner_name}][COM-SYNC] envoi SYNC msgClock={send_clock}")
+    PyBus.Instance().post(bm)
+
+    # Préparer la barrière
+    self._sync_received = {self.owner_name}  # je me compte déjà
+    self._sync_event = Event()
+
+    # Bloque jusqu'à réception de tous les SYNC
+    while not self._sync_event.wait(timeout=0.1):
+      pass
+    print(f"[{self.owner_name}][COM-SYNC] Tous les SYNC reçus, barrière franchie")
+
+    # Nettoyage des variables temporaires
+    del self._sync_received
+    del self._sync_event
+
   # --------------------------------------------------------------
   # Communications Synchrones
   # --------------------------------------------------------------
 
-  # Broadcast synchrone (barrière) : envoi un message de type 'SYNC' et attend que tous les autres aient fait de même
-  def broadcastSync(self, payload, from_id: int, my_id: int, npProcess: int):
+  # Broadcast synchrone :
+  # - si je suis l'emetteur, j'envoie et j'attends que tous les autres aient fait de même
+  # - sinon j'attends de recevoir le broadcast et j'envoie un ACK
+  def broadcastSync(self, payload, from_id: int, my_id: int):
 
     # Cas 1 : je suis l'emetteur
     if from_id == my_id:
       send_clock = self.incrementClock()
       bm = BroadcastMessage({"type": "SYNC-BROADCAST", "data": payload}, send_clock, self.owner_name)
-      print(f"[{self.owner_name}][COM-SYNC-BROADCAST] msg={payload} msgClock={send_clock} -> envoi à tous")
+      print(f"[{self.owner_name}][COM-SYNC-BROADCAST] msg={payload} msgClock={send_clock}")
       PyBus.Instance().post(bm)
 
-      # J'attends que tous les autres aient fait de même
-      ack_event = Event()
+      # J'attends les ACK de tous les autres
       self._acks_received = 0
-      self._acks_target = npProcess - 1  # tous sauf moi
-      self._acks_event = ack_event
+      self._acks_target = self.npProcess - 1  # tous sauf moi
+      self._acks_event = Event()
 
       # Bloque jusqu'à réception de tous les ACK
-      while not ack_event.wait(timeout=0.1):
+      while not self._acks_event.wait(timeout=0.1):
         pass
       print(f"[{self.owner_name}][COM-SYNC-BROADCAST] Tous les ACK reçus, barrière franchie")
 
