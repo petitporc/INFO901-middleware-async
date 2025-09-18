@@ -1,13 +1,7 @@
 from threading import Lock, Thread, Event
 from queue import Empty
-
 from time import sleep
 
-#from geeteventbus.subscriber import subscriber
-#from geeteventbus.eventbus import eventbus
-#from geeteventbus.event import event
-
-#from EventBus import EventBus
 from Message import Message
 from BroadcastMessage import BroadcastMessage
 from MessageTo import MessageTo
@@ -52,89 +46,36 @@ class Process(Thread):
         # Liste des participants connus
         self.participants = set()
 
-        # Je m'annonce aux autres
-        self.broadcast({"type": "REGISTER", "name": self.myProcessName})
-        self.participants.add(self.myProcessName)
-        print(f"[{self.getName()}][REGISTER] annoncé {self.myProcessName}, attente de {self.npProcess} participants...")
-
         # Démarrage du thread
         self.start()
     
+    # --------------------------------------------------------------
+    # Wrapers vers Com
+    # --------------------------------------------------------------
+
     # Incrément de l'horloge Lamport avec accès lock
     def incrementClock(self):
-        # Délégation à Com
         return self.com.incrementClock()
 
     # Mise à jour de l'horloge lors de la récupération
     def updateClockOnReceive(self, receivedClock):
-        # Délégation à Com
         return self.com.update_on_receive(receivedClock)
     
     # Accès en lecture de l'horloge
     def getClock(self):
-        # Délégation à Com
         return self.com.getClock()
 
     # Ajout du broadcastMessage
     def broadcast(self, payload):
-        # délégation à Com
         self.com.broadcast(payload)
 
     # Ajout de sendTo
     def sendTo(self, payload, to):
-        # délégation à Com
         self.com.sendTo(payload, to)
 
-    # Renvoi l'ID du voisin suivant sur l'anneau
-    def nextId(self):
-        return (self.myId + 1) % self.npProcess
-
-    # Envoi du jeton au prochain
-    def sendToken(self, to_id: int):
-        send_clock = self.getClock() # ne pas incrémenter l'horloge
-        tm = TokenMessage(send_clock, self.myProcessName, to_id)
-        print(f"[{self.getName()}][TOKEN-SEND] to=P{to_id} clock={tm.getClock()} sender={tm.getSender()}")
-        PyBus.Instance().post(tm)
-    
-    # Demander le jeton
-    def request(self):
-        self.waiting = True
-        print(f"[{self.getName()}][REQUEST] J'attends le jeton...")
-
-        # bloquer jusqu'au jeton
-        self.token_event.wait()
-        self.token_event.clear()
-        print(f"[{self.getName()}][ENTER] J'entre en SC")
-    
-    # Relacher le jeton
-    def release(self):
-        if not self.holding_token:
-            return
-        print(f"[{self.getName()}][EXIT] Je sors de la SC")
-        self.waiting = False
-        self.holding_token = False
-        self.sendToken(self.nextId())
-
-    # Méthode de synchronisation
-    def synchronize(self):
-        print(f"[{self.getName()}][SYNC] Demande de synchronisation...")
-        # Je m'ajoute comme prête sans écraser ce qui est déjà arrivé
-        with self.sync_lock:
-            self.sync_seen.add(self.myProcessName)
-            count = len(self.sync_seen)
-            if count >= self.npProcess:
-                self.sync_event.set()
-
-        # J'annonce aux autres que je suis prêt
-        self.broadcast({"type": "SYNC"})
-
-        # J'attends les autres
-        while self.alive and not self.sync_event.is_set():
-            self.sync_event.wait(timeout=0.1)
-        
-        if self.sync_event.is_set():
-            print(f"[{self.getName()}][SYNC] Barrière franchie")
-
+    # --------------------------------------------------------------
+    # Abonnement aux événements
+    # --------------------------------------------------------------
 
     @subscribe(threadMode = Mode.PARALLEL, onEvent=Message)
     def process(self, event):
@@ -200,24 +141,9 @@ class Process(Thread):
         print(f"[{self.getName()}][RECV-TO] from={event.getSender()} to={event.getTo()} msg={payload} msgClock={event.getClock()} -> localClock={updated} (thread={threading.current_thread().name})")
         self.com.enqueue_incoming(event)
 
-    @subscribe(threadMode = Mode.PARALLEL, onEvent=TokenMessage)
-    def onToken(self, event):
-        # Seul le destinataire traite le message
-        if event.getTo() != self.myId:
-            return
-        local = self.getClock() # ne pas incrémenter l'horloge
-        print(f"[{self.getName()}][TOKEN-RECV] from={event.getSender()} -> localClock={local}")
-
-        if self.waiting:
-            # ce processus garde le jeton
-            self.holding_token = True
-            self.token_event.set()  # pour reveiller request
-            print(f"[{self.getName()}][TOKEN-HELD] je garde le jeton pour la SC")
-        else:
-            # ce processus relaye le jeton
-            if self.alive:
-                sleep(0.5)
-                self.sendToken(self.nextId())
+    #--------------------------------------------------------------
+    # Boucle principale
+    #--------------------------------------------------------------
 
     def run(self):
         loop = 0
@@ -261,6 +187,10 @@ class Process(Thread):
                 self.myId = sorted_names.index(self.myProcessName)
                 print(f"[{self.getName()}][REGISTER] participants={sorted_names} -> myID={self.myId}")
 
+                # on recopie dans Com
+                self.com.myId = self.myId
+                self.com.npProcess = self.npProcess
+
                 # 4) si je suis le dernier (ID max = npProcess-1), je déclenche le jeton
                 if self.myId == self.npProcess - 1:
                     def _delayed_start():
@@ -268,7 +198,7 @@ class Process(Thread):
                         with Process._token_lock:
                             if not Process._token_started:
                                 print(f"[{self.getName()}] Initial token launch -> P0")
-                                self.sendToken(to_id=0)
+                                self.com.sendToken(to_id=0)
                                 Process._token_started = True
                     Thread(target=_delayed_start, daemon=True).start()
             # --- fin phase REGISTER ---
@@ -301,15 +231,15 @@ class Process(Thread):
             # Demande de section critique
             # Exemple : P1 demande la SC après 3 tours
             if self.myProcessName == "P1" and loop == 3:
-                self.request()
+                self.com.requestSC()
                 sleep(2)  # simulation de travail en SC
-                self.release()
+                self.com.releaseSC()
 
             # Exemple : P2 demande la SC après 6 tours
             if self.myProcessName == "P2" and loop == 6:
-                self.request()
+                self.com.requestSC()
                 sleep(2)
-                self.release()
+                self.com.releaseSC()
 
         
             loop+=1

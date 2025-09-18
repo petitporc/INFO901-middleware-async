@@ -1,7 +1,8 @@
 from threading import Lock, Event
 from queue import Queue, Empty
+import time
 
-from pyeventbus3.pyeventbus3 import PyBus
+from pyeventbus3.pyeventbus3 import PyBus, Mode, subscribe
 
 from Message import Message
 from MessageTo import MessageTo
@@ -15,6 +16,8 @@ class Com:
   - les envois de message (publish, broadcast, send_to)
   - la boite aux lettres (mailbox) pour les réceptions
   - la mise à jour d'horloge à la reception
+  - les communications synchrones (barrières et envois/recep. bloquants)
+  - la section critique distribuée (token ring)
   """
 
   def __init__(self, owner_name: str):
@@ -25,18 +28,31 @@ class Com:
     # Boîte aux lettres des messages reçus pour ce process
     self._mailbox = Queue()
 
+    # État section critique distribuée (token ring)
+    self.waiting = False
+    self.holding_token = False
+    self.token_event = Event()  # pour bloquer en attente du token
+
+    # Infos sur le processus
+    self.myId = None # sera fixé par le process après REGISTER
+    self.npProcess = None # sera fixé par le process après REGISTER
+    self.alive = True
+
+    # Inscription au bus
+    PyBus.Instance().register(self, self)
+
   # --------------------------------------------------------------
   # Horloge de Lamport (APIs)
   # Règle Lamport: clock = max(local, received) + 1
   # --------------------------------------------------------------
 
-  # Incrementer l'horloge de Lamport
+  # Incrementer l'horloge locale
   def incrementClock(self) -> int:
     with self._clock_lock:
       self._clock += 1
       return self._clock
     
-  # Lecture de l'horloge de Lamport
+  # Retourne la valeur courante de l'horloge
   def getClock(self) -> int:
     with self._clock_lock:
       return self._clock
@@ -152,16 +168,22 @@ class Com:
 
   # Réception synchrone :  bloque jusuq'à la réception d'un message venant de 'from_id'
   def receiveFromSync(self, from_id: int, timeout=None):
-    while True:
-      msg = self.try_get(timeout=timeout)
-      if msg is None:
-        continue
-      if isinstance(msg, MessageTo) and msg.getSender() == f"P{from_id}":
-        print(f"[{self.owner_name}][COM-RECEIVE-FROM-SYNC] reçu de P{from_id} -> msg={msg.getPayload()}")
-        # Répondre par un ACK
-        ack = MessageTo({"type": "ACK-SYNC-TO"}, self.incrementClock(), self.owner_name, from_id)
-        PyBus.Instance().post(ack)
-        return msg
+    try:
+      while True:
+        msg = self.try_get(timeout=timeout)
+        if msg is None:
+          continue
+        if isinstance(msg, MessageTo):
+          sender = msg.getSender()
+          if sender == f"P{from_id}" or sender == from_id:
+            print(f"[{self.owner_name}][COM-RECEIVE-FROM-SYNC] reçu de P{from_id} -> msg={msg.getPayload()}")
+            # Répondre par un ACK
+            ack = MessageTo({"type": "ACK-SYNC-TO"}, self.incrementClock(), self.owner_name, from_id)
+            PyBus.Instance().post(ack)
+            return msg
+    except Empty:
+      print(f"[{self.owner_name}][COM-RECEIVE-FROM-SYNC] timeout d'attente écoulé")
+      return None
   
   # Incrémente le compteur d'ACK reçus et débloque si tous reçus
   def handle_ack(self):
@@ -169,5 +191,55 @@ class Com:
       self._acks_received += 1
       if self._acks_received >= self._acks_target:
         self._acks_event.set()
+  
+  # --------------------------------------------------------------
+  # Section Critique Distribuée (Token Ring)
+  # --------------------------------------------------------------
+  # Demande l'entrée en section critique (bloque jusqu'à obtention du token)
+  def requestSC(self):
+    self.waiting = True
+    print(f"[{self.owner_name}][REQUEST] J'attends le token...")
+    self.token_event.wait()  # bloque jusqu'à obtention du token
+    self.token_event.clear()  # réinitialise l'event pour la prochaine fois
+    print(f"[{self.owner_name}][ENTER] J'ai le token, j'entre en SC")
+  
+  # Libère le token et le passe au suivant
+  def releaseSC(self):
+    if not self.holding_token:
+      return
+    print(f"[{self.owner_name}][EXIT] Je quitte la SC et passe le token au suivant")
+    self.waiting = False
+    self.holding_token = False
+  
+  # Envoi du token au voisin suivant
+  def sendToken(self, to_id: int):
+    send_clock = self.getClock()  # pas d'incrémentation ici
+    tm = TokenMessage(send_clock, self.owner_name, to_id)
+    print(f"[{self.owner_name}][TOKEN-SEND] to=P{to_id} clock={tm.getClock()} sender={tm.getSender()}")
+    PyBus.Instance().post(tm)
+  
+  # Calcule l'ID du voisin suivant dans le ring
+  def nextId(self):
+    return (self.myId + 1) % self.npProcess
 
+  # Réception du token (handler d'événement)
+  @subscribe(threadMode=Mode.PARALLEL, onEvent=TokenMessage)
+  def onToken(self, event):
+    if not self.alive:
+      return
+    if event.getTo() != self.myId:
+      return
+    
+    local = self.getClock()
+    print(f"[{self.owner_name}][TOKEN-RECV] from={event.getSender()} waiting={self.waiting} -> localClock={local}")
 
+    if self.waiting:
+      # Garde le jeton pour la SC
+      self.holding_token = True
+      self.token_event.set()  # pour reveiller request
+      print(f"[{self.owner_name}][TOKEN-HELD] je garde le jeton pour la SC")
+    else:
+      # ce processus relaye le jeton
+      if self.alive:
+        time.sleep(0.5)
+        self.sendToken(self.nextId())

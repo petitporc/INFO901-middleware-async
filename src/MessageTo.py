@@ -1,7 +1,7 @@
 from MessageBase import MessageBase
 
 class MessageTo(MessageBase):
-  def __init__(self, payload, clock, sender, to, payload_type=None):
+  def __init__(self, payload, clock, sender: int, to: int, payload_type=None):
     super().__init__(payload, clock, sender, payload_type)
     self.to = to
   
