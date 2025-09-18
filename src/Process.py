@@ -94,7 +94,7 @@ class Process(Thread):
 
     # Envoi du jeton au prochain
     def sendToken(self, to_id: int):
-        send_clock = self.incrementClock()
+        send_clock = self.getClock() # ne pas incrémenter l'horloge
         tm = TokenMessage(send_clock, self.myProcessName, to_id)
         print(f"[{self.getName()}][TOKEN-SEND] to=P{to_id} clock={tm.getClock()} sender={tm.getSender()}")
         PyBus.Instance().post(tm)
@@ -199,8 +199,8 @@ class Process(Thread):
         # Seul le destinataire traite le message
         if event.getTo() != self.myId:
             return
-        updated = self.updateClockOnReceive(event.getClock())
-        print(f"[{self.getName()}][TOKEN-RECV] from={event.getSender()} -> localClock={updated}")
+        local = self.getClock() # ne pas incrémenter l'horloge
+        print(f"[{self.getName()}][TOKEN-RECV] from={event.getSender()} -> localClock={local}")
 
         if self.waiting:
             # ce processus garde le jeton
