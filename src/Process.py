@@ -1,4 +1,5 @@
 from threading import Lock, Thread, Event
+from queue import Empty
 
 from time import sleep
 
@@ -26,42 +27,38 @@ class Process(Thread):
         Thread.__init__(self)
 
         self.npProcess = npProcess
-        self.myId = Process.nbProcessCreated
-        Process.nbProcessCreated +=1
         self.myProcessName = name
         self.com = Com(self.myProcessName)
         self.setName("MainThread-" + name)
 
-        PyBus.Instance().register(self, self)
-
+        # États internes
         self.alive = True
-
-        # Initialisation de l'horloge Lamport avec des locks
         self.clock = 0
         self.lock = Lock()
-
-        # Etat token ring
         self.waiting = False # en demande de section critique ?
         self.holding_token = False # en possession du token ?
         self.token_event = Event() # pour reveiller request
-
-        # Synchronisation des processus
         self.sync_event = Event()
         self.sync_seen = set()
         self.sync_lock = Lock()
 
-        self.start()
+        # Inscription au bus d'événements
+        PyBus.Instance().register(self, self)
 
-        # si je suis le dernier créé, j'initialise le jeton vers P0 (après un court délai)
-        if self.myId == self.npProcess - 1:
-            def _delayed_start():
-                sleep(0.2)
-                with Process._token_lock:
-                    if not Process._token_started:
-                        print(f"[{self.getName()}] Initial token launch -> P0")
-                        self.sendToken(to_id=0)
-                        Process._token_started = True
-            Thread(target=_delayed_start, daemon=True).start()
+        # --------------------------------------------------------------
+        # Phase REGISTER (numéro d'ID déterministe)
+        # --------------------------------------------------------------
+
+        # Liste des participants connus
+        self.participants = set()
+
+        # Je m'annonce aux autres
+        self.broadcast({"type": "REGISTER", "name": self.myProcessName})
+        self.participants.add(self.myProcessName)
+        print(f"[{self.getName()}][REGISTER] annoncé {self.myProcessName}, attente de {self.npProcess} participants...")
+
+        # Démarrage du thread
+        self.start()
     
     # Incrément de l'horloge Lamport avec accès lock
     def incrementClock(self):
@@ -230,6 +227,51 @@ class Process(Thread):
             local_clock = self.incrementClock()
             print(f"[{self.getName()}][LOOP {loop}] localClock={local_clock}")
             sleep(1)
+
+            # --- PHASE REGISTER (numérotation déterministe) ---
+            if loop == 0:
+                # 1) j'annonce
+                self.participants = set()
+                self.participants.add(self.myProcessName)
+                self.broadcast({"type": "REGISTER", "name": self.myProcessName})
+                print(f"[{self.getName()}][REGISTER] annoncé {self.myProcessName}, attente de {self.npProcess} participants...")
+
+                # 2) je collecte avec un timeout global (ex: 3s)
+                import time
+                deadline = time.time() + 3.0  # ajuste si besoin
+                while len(self.participants) < self.npProcess and time.time() < deadline:
+                    try:
+                        msg = self.com.try_get(timeout=0.2)  # peut lever Empty
+                    except Empty:
+                        continue
+                    payload = msg.getPayload()
+                    if isinstance(payload, dict) and payload.get("type") == "REGISTER":
+                        self.participants.add(payload["name"])
+                        print(f"[{self.getName()}][REGISTER] reçu {payload['name']} ({len(self.participants)}/{self.npProcess})")
+                    else:
+                        # remet en BAL ce qui n'est pas du REGISTER
+                        self.com.enqueue_incoming(msg)
+
+                # 3) calcul de l'ID (même si tout le monde n'a pas répondu, on essaye)
+                sorted_names = sorted(self.participants)
+                if self.myProcessName not in sorted_names:
+                    sorted_names.append(self.myProcessName)
+                    sorted_names = sorted(sorted_names)
+
+                self.myId = sorted_names.index(self.myProcessName)
+                print(f"[{self.getName()}][REGISTER] participants={sorted_names} -> myID={self.myId}")
+
+                # 4) si je suis le dernier (ID max = npProcess-1), je déclenche le jeton
+                if self.myId == self.npProcess - 1:
+                    def _delayed_start():
+                        sleep(0.2)
+                        with Process._token_lock:
+                            if not Process._token_started:
+                                print(f"[{self.getName()}] Initial token launch -> P0")
+                                self.sendToken(to_id=0)
+                                Process._token_started = True
+                    Thread(target=_delayed_start, daemon=True).start()
+            # --- fin phase REGISTER ---
 
             # Synchronisation des processus au tour 2 avec le middleware
             if self.myProcessName == "P0" and loop == 2:
