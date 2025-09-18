@@ -45,7 +45,11 @@ class Com:
 
     # REGISTER
     self.participants = set()
-    self.register_event = Event()
+
+    # Enregistrement de l'ordre d'arrivée des REGISTER
+    self._register_records = [] # liste de tuples (clock, name)
+    self._register_seen = set() # pour éviter les doublons
+    self.register_event = Event()  # permet de réveiller register() quand tous reçus
 
     # Inscription au bus
     PyBus.Instance().register(self, self)
@@ -125,28 +129,29 @@ class Com:
 
   # Envoi de mon REGISTER
   def register(self):
-    # Annonce
+    # Réinitialise le suivi d'inscription
     self.participants = {self.owner_name}  # je me compte déjà
-    self.broadcast({"type": "REGISTER", "name": self.owner_name})
+    self._register_records = []
+    self._register_seen = {self.owner_name}
+
+    # Diffuse mon REGISTER et mémorise l'horloge d'envoi
+    my_reg_clock = self.incrementClock()
+    self.broadcast({"type": "REGISTER", "name": self.owner_name, "clock": my_reg_clock})
+    self._register_records.append((my_reg_clock, self.owner_name))
+
     print(f"[{self.owner_name}][REGISTER] annoncé {self.owner_name}, attente de {self.npProcess} participants...")
 
     # Attente des autres REGISTER
     while len(self.participants) < self.npProcess:
       self.register_event.wait(timeout=0.2)  # reveil périodique pour vérifier la condition
-      
-    # Calcul des IDs si tous reçus
-    sorted_names = sorted(self.participants)
-    self.myId = sorted_names.index(self.owner_name)
-    print(f"[{self.owner_name}][REGISTER] participants={sorted_names} -> myID={self.myId}")
 
-    # Démarage du token si je suis le dernier
-    if self.myId == self.npProcess - 1:
-      def _delayed_start():
-        time.sleep(0.5)  # petit délai pour laisser le temps aux autres de finir leur REGISTER
-        print(f"[{self.owner_name}][TOKEN-START] je démarre le token -> P0")
-        self.sendToken(to_id=0)
-      from threading import Thread
-      Thread(target=_delayed_start, daemon=True).start()
+    # Calcul des IDs par ordre d'arrivée (horloge, puis nom pour déterminisme)
+    ordered = sorted(self._register_records, key=lambda t: (t[0], t[1]))
+    sorted_names = [name for _, name in ordered]
+    self.name_to_id = {name: idx for idx, name in enumerate(sorted_names)}
+    self.myId = sorted_names.index(self.owner_name)
+
+    print(f"[{self.owner_name}][REGISTER] ordre d'arrivée={sorted_names} -> myID={self.myId}")
     
     return self.myId
   
@@ -160,16 +165,35 @@ class Com:
 
     # Gestion des REGISTER
     if isinstance(payload, dict) and payload.get("type") == "REGISTER":
-      self.participants.add(payload["name"])
-      print(f"[{self.owner_name}][REGISTER] reçu de {payload['name']} ({len(self.participants)}/{self.npProcess})")
+      name = payload["name"]
+      if name not in self._register_seen:
+        self._register_seen.add(name)
+        self.participants.add(name)
+        # on stocke l'horloge envoyée par le processus emetteur
+        msg_clock = payload.get("clock", event.getClock())
+        self._register_records.append((msg_clock, name))
+
+      print(f"[{self.owner_name}][REGISTER] reçu de {name} ({len(self.participants)}/{self.npProcess})")
+
       if self.npProcess is not None and len(self.participants) >= self.npProcess:
         self.register_event.set()  # reveille la boucle d'attente
       return
     
+    # Gestion des REQUEST (SC)
+    if isinstance(payload, dict) and payload.get("type") == "REQUEST":
+      requester = payload["from"]
+      print(f"[{self.owner_name}][REQUEST-RECV] reçu REQUEST de P{requester}")
+      if self.holding_token and not self.waiting:
+        # Je n'attends pas, je passe le token au demandeur
+        print(f"[{self.owner_name}][REQUEST-RELAY] je passe le token à P{requester}")
+        self.holding_token = False
+        self.sendToken(requester)
+      return
+
     # Gestion des SYNC
     if isinstance(payload, dict) and payload.get("type") == "SYNC":
       self._sync_received.add(event.getSender())
-      print(f"[{self.owner_name}][COM-SYNC-RECV] reçu SYNC de {event.getSender()} ({len(self._sync_received)}/{self._sync_target})")
+      print(f"[{self.owner_name}][COM-SYNC-RECV] reçu SYNC de {event.getSender()} ({len(self._sync_received)}/{self.npProcess})")
       if len(self._sync_received) >= self.npProcess:
         self._sync_event.set()  # reveille la boucle d'attente
       return
@@ -178,7 +202,8 @@ class Com:
     if isinstance(payload, dict) and payload.get("type") == "SYNC-BROADCAST":
       print(f"[{self.owner_name}][COM-SYNC-BROADCAST-RECV] reçu SYNC-BROADCAST de {event.getSender()} -> msg={payload['data']}")
       # Répondre par un ACK
-      ack = MessageTo({"type": "ACK-SYNC-BROADCAST"}, self.incrementClock(), self.owner_name, event.getSender())
+      to_id = self.name_to_id.get(event.getSender(), event.getSender())
+      ack = MessageTo({"type": "ACK-SYNC-BROADCAST"}, self.incrementClock(), self.owner_name, to_id)
       PyBus.Instance().post(ack)
       print(f"[{self.owner_name}][COM-SYNC-ACK-SEND] envoyé ACK à {event.getSender()}")
       return
@@ -188,7 +213,7 @@ class Com:
 
   @subscribe(threadMode=Mode.PARALLEL, onEvent=MessageTo)
   def onReceive(self, event):
-    if self.myId is None and event.getTo() != self.myId:
+    if self.myId is None or event.getTo() != self.myId:
       return
     
     payload = event.getPayload()
@@ -323,6 +348,8 @@ class Com:
   def requestSC(self):
     self.waiting = True
     print(f"[{self.owner_name}][REQUEST] J'attends le token...")
+    # Annonce aux autres que je veux entrer en SC (optionnel)
+    self.broadcast({"type": "REQUEST", "from": self.myId})
     self.token_event.wait()  # bloque jusqu'à obtention du token
     self.token_event.clear()  # réinitialise l'event pour la prochaine fois
     print(f"[{self.owner_name}][ENTER] J'ai le token, j'entre en SC")
@@ -334,6 +361,7 @@ class Com:
     print(f"[{self.owner_name}][EXIT] Je quitte la SC et passe le token au suivant")
     self.waiting = False
     self.holding_token = False
+    self.sendToken(self.nextId()) # passage explicite après la SC
   
   # Envoi du token au voisin suivant
   def sendToken(self, to_id: int):
@@ -357,13 +385,57 @@ class Com:
     local = self.getClock()
     print(f"[{self.owner_name}][TOKEN-RECV] from={event.getSender()} waiting={self.waiting} -> localClock={local}")
 
+    if not self.alive:
+      return
+
     if self.waiting:
       # Garde le jeton pour la SC
       self.holding_token = True
       self.token_event.set()  # pour reveiller request
       print(f"[{self.owner_name}][TOKEN-HELD] je garde le jeton pour la SC")
     else:
-      # ce processus relaye le jeton
-      if self.alive and not self.holding_token:
-        time.sleep(0.5)
-        self.sendToken(self.nextId())
+      # Je n'attends pas, je garde le jeton en réserve
+      self.holding_token = True
+      print(f"[{self.owner_name}][TOKEN-RELAY] je garde le jeton en réserve")
+
+  # Arrête proprement le communicateur
+  def stop(self):
+    self.alive = False
+    try:
+      self.com.stop()
+    except Exception:
+      pass
+
+    # Débloque une éventuelle attente du token
+    try:
+      self.token_event.set()
+    except Exception:
+      pass
+
+    # Si une barrière SYNC est en cours, la libérer
+    if hasattr(self, '_sync_event') and self._sync_event is not None:
+      try:
+        self._sync_event.set()
+      except Exception:
+        pass
+    
+    # Si un broadcastSync/sendToSync est en cours, le libérer
+    if hasattr(self, '_acks_event') and self._acks_event is not None:
+      try:
+        self._acks_event.set()
+      except Exception:
+        pass
+    
+    # Débloque une éventuelle get() bloquante si jamais elle est utilisée sans timeout
+    try:
+      self._mailbox.put_nowait(None)
+    except Exception:
+      pass
+    
+    # Se désinscrire du bus
+    try:
+      PyBus.Instance().unregister(self)
+    except Exception:
+      pass
+
+      

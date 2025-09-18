@@ -81,7 +81,11 @@ class Process(Thread):
             # Horloge locale
             local_clock = self.incrementClock()
             print(f"[{self.getName()}][LOOP {loop}] localClock={local_clock}")
-            sleep(1)
+
+            for _ in range(10):
+                if not self.alive:
+                    break
+                sleep(0.1)
 
             # PHASE REGISTER
             if loop == 0:
@@ -147,9 +151,13 @@ class Process(Thread):
 
     def stop(self):
         self.alive = False
-        # Débloquer toute attente éventuelle
-        #self.token_event.set()
-        #self.sync_event.set()
+        try:
+            PyBus.Instance().unregister(self, self)
+        except Exception:
+            pass
+        self.com.stop()
 
     def waitStopped(self):
+        if self.is_alive():
+            self.stop()
         self.join()
