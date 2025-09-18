@@ -95,7 +95,7 @@ class Com:
       return None
   
   # --------------------------------------------------------------
-  # Broadcast Synchrone
+  # Communications Synchrones
   # --------------------------------------------------------------
 
   # Broadcast synchrone (barrière) : envoi un message de type 'SYNC' et attend que tous les autres aient fait de même
@@ -118,6 +118,50 @@ class Com:
       while not ack_event.wait(timeout=0.1):
         pass
       print(f"[{self.owner_name}][COM-SYNC-BROADCAST] Tous les ACK reçus, barrière franchie")
+
+      # Nettoyage des variables temporaires
+      del self._acks_received
+      del self._acks_target
+      del self._acks_event
+  
+  # Envoi synchrone : envoi d'un message dédié à 'to' et attend un ACK
+  def sendToSync(self, payload, to, my_id: int):
+    send_clock = self.incrementClock()
+    mt = MessageTo(payload, send_clock, self.owner_name, to)
+    print(f"[{self.owner_name}][COM-SEND-TO-SYNC] msg={mt.getPayload()} msgClock={mt.getClock()} sender={mt.getSender()} to={to}")
+
+    # Prépare un event pour attendre l'ACK
+    self._acks_received = 0
+    self._acks_target = 1  # un seul ACK attendu
+    self._acks_event = Event()
+    self._acks_from = to  # on note de qui on attend l'ACK
+
+    # Envoi du message
+    PyBus.Instance().post(mt)
+
+    # Bloque jusqu'à réception de l'ACK
+    while not self._acks_event.wait(timeout=0.1):
+      pass
+    print(f"[{self.owner_name}][COM-SEND-TO-SYNC] ACK reçu de P{to}")
+
+    # Nettoyage des variables temporaires
+    del self._acks_received
+    del self._acks_target
+    del self._acks_event
+    del self._acks_from
+
+  # Réception synchrone :  bloque jusuq'à la réception d'un message venant de 'from_id'
+  def receiveFromSync(self, from_id: int, timeout=None):
+    while True:
+      msg = self.try_get(timeout=timeout)
+      if msg is None:
+        continue
+      if isinstance(msg, MessageTo) and msg.getSender() == f"P{from_id}":
+        print(f"[{self.owner_name}][COM-RECEIVE-FROM-SYNC] reçu de P{from_id} -> msg={msg.getPayload()}")
+        # Répondre par un ACK
+        ack = MessageTo({"type": "ACK-SYNC-TO"}, self.incrementClock(), self.owner_name, from_id)
+        PyBus.Instance().post(ack)
+        return msg
   
   # Incrémente le compteur d'ACK reçus et débloque si tous reçus
   def handle_ack(self):
@@ -125,9 +169,5 @@ class Com:
       self._acks_received += 1
       if self._acks_received >= self._acks_target:
         self._acks_event.set()
-        # Nettoyage des variables temporaires
-        del self._acks_received
-        del self._acks_target
-        del self._acks_event
 
 

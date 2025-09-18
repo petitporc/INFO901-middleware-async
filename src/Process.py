@@ -183,11 +183,20 @@ class Process(Thread):
         
         # Vérification du type payload
         payload = event.getPayload()
-        if isinstance(payload, dict) and payload.get("type") == "ACK-SYNC":
-            # c'est un ACK de synchro -> passe par le communicateur
-            print(f"[{self.getName()}][SYNC-ACK-RECV] de {event.getSender()}")
-            self.com.handle_ack()
-            return # pas de mise en boîte aux lettres
+
+        # Gestion des ACK de synchro
+        if isinstance(payload, dict):
+            if payload.get("type") == "ACK-SYNC":
+                # ACK de broadcastSync
+                print(f"[{self.getName()}][SYNC-ACK-RECV] de {event.getSender()}")
+                self.com.handle_ack()
+                return # pas de mise en boîte aux lettres
+                
+            if payload.get("type") == "ACK-SYNC-TO":
+                # ACK de sendToSync
+                print(f"[{self.getName()}][SYNC-ACK-TO-RECV] de {event.getSender()}")
+                self.com.handle_ack()
+                return # pas de mise en boîte aux lettres
         
         # Traitement normal
         updated = self.updateClockOnReceive(event.getClock())
@@ -225,6 +234,16 @@ class Process(Thread):
             # Synchronisation des processus au tour 2 avec le middleware
             if self.myProcessName == "P0" and loop == 2:
                 self.com.broadcastSync("Hello everyone, sync time!", from_id=0, my_id=self.myId, npProcess=self.npProcess)
+            
+            # Exemple de test SendToSync / ReceiveFromSync
+            if self.myProcessName == "P0" and loop == 3:
+                print(f"[{self.getName()}] TEST sendToSync vers P1")
+                self.com.sendToSync({"type": "test-sync", "text": "Hello P1, synchro!"}, to=1, my_id=self.myId)
+
+            if self.myProcessName == "P1" and loop == 3:
+                print(f"[{self.getName()}] TEST receiveFromSync de P0")
+                msg = self.com.receiveFromSync(from_id=0, timeout=5)
+                print(f"[{self.getName()}] Message synchrone reçu de P0 -> {msg.getPayload()}")
 
             # Envoi de messages par P1
             if self.myProcessName == "P1":
