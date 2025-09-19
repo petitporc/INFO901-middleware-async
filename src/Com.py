@@ -251,7 +251,11 @@ class Com:
     self.myId = sorted_names.index(self.owner_name)
     self.alive_names = set(sorted_names)
     self._register_complete = True
-    #self._start_heartbeats() # démarrage des threads de heartbeats après REGISTER
+
+    now = time.time()
+    for name in sorted_names:
+      self.last_seen[name] = now # tout le monde est vu "récent" d'emblée
+
     for pv in self._pending_views:
       self._adopt_view(pv["alive"], pv["version"], pv["sender"])
     self._pending_views.clear()
@@ -646,7 +650,7 @@ class Com:
       now = time.time()
 
       # On part de tous ceux qu'on a vus au moins une fois
-      known = set(self.last_seen.keys()) | self.participants | set([self.owner_name])
+      known = set(self.last_seen.keys()) | {self.owner_name}
 
       # Vivants = last_seen récent
       alive = set()

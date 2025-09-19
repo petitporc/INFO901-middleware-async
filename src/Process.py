@@ -85,6 +85,7 @@ class Process(Thread):
             self._log("BARRIER", f"Attente de REGISTER de tous les processus")
             self.com.synchronize(self.npProcess) 
             self._log("BARRIER", f"REGISTER de tous les processus OK")
+            self.com._start_heartbeats()
 
             # --- ÉTAPE 1 --- : Dernier processus démarre le jeton
             if self.com.getMyId() == self.npProcess - 1:
@@ -158,93 +159,6 @@ class Process(Thread):
             self.alive = False
             self._log("STOP", "Processus terminé")
             self.com.stop()
-
-
-
-
-
-
-
-        """
-        loop = 0
-        while self.alive:
-
-            # Horloge locale
-            local_clock = self.incrementClock()
-            self._log("LOOP", f"itération={loop} horloge={local_clock}")
-
-            # PHASE REGISTER
-            if loop == 0:
-                self.com.register() # ID stocké dans le communicateur
-
-                # barrière pour s'assurer que tout le monde a fini de REGISTER
-                self._log("BARRIER", f"Attente de REGISTER de tous les processus")
-                self.com.synchronize(self.npProcess) 
-                self._log("BARRIER", f"REGISTER de tous les processus OK")
-
-                # Dernier processus démarre le jeton
-                if self.com.getMyId() == self.npProcess - 1:
-                    def _delayed_start():
-                        sleep(0.2)
-                        with Process._token_lock:
-                            if not Process._token_started:
-                                self._log("TOKEN", f"Lancement initial du token -> P0")
-                                self.com.sendToken(to_id=0)
-                                Process._token_started = True
-                    Thread(target=_delayed_start, daemon=True).start()
-            
-            for _ in range(10):
-                if not self.alive:
-                    break
-                sleep(0.1)
-
-            # EXEMPLES D'UTILISATION
-
-            # Synchronisation des processus au tour 2 avec le middleware
-            if self.myProcessName == "P0" and loop == 2:
-                self.com.broadcastSync("Hello everyone, sync time!", from_id=0, my_id=self.com.getMyId())
-            
-            # Exemple de test SendToSync / ReceiveFromSync
-            if self.myProcessName == "P0" and loop == 3:
-                self._log("TEST-SYNC-TO", f"test sendToSync vers P1")
-                self.com.sendToSync({"type": "test-sync", "text": "Hello P1, synchro!"}, to=1, my_id=self.com.getMyId())
-
-            if self.myProcessName == "P1" and loop == 3:
-                self._log("TEST-SYNC-FROM", f"test receiveFromSync de P0")
-                msg = self.com.receiveFromSync(from_id=0, timeout=5)
-                if msg:
-                    self._log("TEST-SYNC-FROM", f"reçu de P0 -> {msg.getPayload()}")
-                else:
-                    self._log("TEST-SYNC-FROM", f"timeout en attente de P0")
-
-            # Envoi de messages par P1
-            if self.myProcessName == "P1":
-                # Envoi de broadcast
-                self.broadcast({"type": "greeting", "text": "ga"})
-
-                # Envoi de message dedié
-                self.sendTo({"type": "greeting", "text": "Hello P0"}, to=0)
-
-                # Envoi de message
-                self.com.publish({"type": "greeting", "text": "bu"})
-
-            # Demande de section critique
-            # Exemple : P1 demande la SC après 3 tours
-            if self.myProcessName == "P1" and loop == 3:
-                self.com.requestSC()
-                sleep(2)  # simulation de travail en SC
-                self.com.releaseSC()
-
-            # Exemple : P2 demande la SC après 6 tours
-            if self.myProcessName == "P2" and loop == 6:
-                self.com.requestSC()
-                sleep(2)
-                self.com.releaseSC()
-
-        
-            loop+=1
-        self._log("STOP", "Arrêt du processus")
-        """
 
     def stop(self):
         self.alive = False
