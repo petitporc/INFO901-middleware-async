@@ -598,6 +598,14 @@ class Com:
   # Heartbeat / vue distribuée
   # ---------------------------------------------------------------------------
   def _start_heartbeats(self):
+    """
+    Démarre les threads de heartbeat (émetteur + moniteur) **une seule fois**.
+
+    - Émetteur : envoie périodiquement un message HEARTBEAT (n’affecte pas Lamport).
+    - Moniteur : détecte les pairs “muets” au-delà de HEARTBEAT_TIMEOUT, recalcule la
+                 vue des vivants et diffuse une VIEW-CHANGE.
+    - Idempotent : si déjà démarré, ne fait rien.
+    """
     if self._hb_sender_alive: # déjà démarrés
       return
     self._hb_sender_alive = True
@@ -695,6 +703,18 @@ class Com:
   # Sécurité
   # ---------------------------------------------------------------------------
   def _safe_post(self, event, label=""):
+    """
+    Poste un événement sur le bus PyBus **avec reprise sur erreur** (robustesse).
+
+    - Objectif : éviter les crashs transitoires du bus (ex. RuntimeError “post during dispatch”)
+                 en réessayant quelques fois plutôt que d’échouer immédiatement.
+    - Politique de retry : jusqu’à 5 tentatives, avec une petite temporisation (100 ms)
+                           entre chaque essai.
+    - Journalisation : en cas d’échec après 5 essais, logge l’erreur pour diagnostic.
+
+    :param event: événement PyBus (Message, BroadcastMessage, MessageTo, TokenMessage…)
+    :param label: étiquette courte affichée dans les logs pour tracer l’origine de l’envoi
+    """
     last_error = None
     for _ in range(5):
       try:

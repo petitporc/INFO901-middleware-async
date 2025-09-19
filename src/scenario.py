@@ -3,7 +3,9 @@ from time import sleep
 
 def play_demo(proc):
     """
-    Rejoue exactement le scénario de démonstration avec l'instance de Process `proc`.
+    Exécute le scénario de démonstration end-to-end avec le Process `proc`.
+    Étapes : REGISTER + barrière → heartbeats → démarrage jeton → envois async →
+    barrière → broadcastSync → sendToSync/receiveFromSync → section critique.
     """
     com = proc.com
     ProcClass = proc.__class__  # accès à _token_lock / _token_started
@@ -15,12 +17,16 @@ def play_demo(proc):
     com.synchronize(proc.npProcess)
     proc._log("BARRIER", "REGISTER de tous les processus OK")
 
-    # Heartbeats (idempotent)
+    # Heartbeats (idempotent) : émission + surveillance
     com._start_heartbeats()
 
     # --- ÉTAPE 1 --- : Dernier processus démarre le jeton
     if com.getMyId() == proc.npProcess - 1:
         def _delayed_start():
+            """
+            Démarre le jeton après un court délai, une seule fois pour tout le système.
+            Utilise un verrou de classe pour éviter plusieurs lancements concurrents.
+            """
             from time import sleep as _sleep
             _sleep(0.2)
             with ProcClass._token_lock:
