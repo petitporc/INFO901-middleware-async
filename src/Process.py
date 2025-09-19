@@ -8,6 +8,8 @@ from MessageTo import MessageTo
 from TokenMessage import TokenMessage
 from Com import Com
 
+from pyeventbus3.pyeventbus3 import *
+
 
 class Process(Thread):
     _token_started = False
