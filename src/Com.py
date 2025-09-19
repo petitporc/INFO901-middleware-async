@@ -1,4 +1,4 @@
-from threading import Lock, Event
+from threading import Lock, Event, Thread
 from queue import Queue, Empty
 import time
 
@@ -54,6 +54,16 @@ class Com:
     # Inscription au bus
     PyBus.Instance().register(self, self)
 
+    # Token manager
+    self._token_q = Queue()
+    self._token_thread_alive = True
+    self._token_thread = Thread(target=self._token_loop, daemon=True)
+    self._token_thread.start()
+  
+  # Logger Uniforme
+  def _log(self, category: str, msg: str):
+    print(f"[COM {self.owner_name}][{category}] {msg}")
+
   # --------------------------------------------------------------
   # Horloge de Lamport (APIs)
   # Règle Lamport: clock = max(local, received) + 1
@@ -84,21 +94,21 @@ class Com:
   def publish(self, payload):
     send_clock = self.incrementClock()
     m = Message(payload, send_clock, self.owner_name)
-    print(f"[{self.owner_name}][COM-PUBLISH] msg={m.getPayload()} msgClock={m.getClock()} sender={m.getSender()}")
+    self._log("SEND", f"publish payload={m.getPayload()} clock={m.getClock()}")
     PyBus.Instance().post(m)
     
   # Envoi 'broadcast' (type BroadcastMessage) : tous les autres reçoivent et l'emetteur s'ignore (affecte l'horloge)
   def broadcast(self, payload):
     send_clock = self.incrementClock()
     bm = BroadcastMessage(payload, send_clock, self.owner_name)
-    print(f"[{self.owner_name}][COM-BROADCAST] msg={bm.getPayload()} msgClock={bm.getClock()} sender={bm.getSender()}")
+    self._log("SEND", f"broadcast payload={bm.getPayload()} clock={bm.getClock()}")
     PyBus.Instance().post(bm)
     
   # Envoi ciblé (type MessageTo) : seul 'to' reçoit (affecte l'horloge)
   def sendTo(self, payload, to):
     send_clock = self.incrementClock()
     mt = MessageTo(payload, send_clock, self.owner_name, to)
-    print(f"[{self.owner_name}][COM-SEND-TO] msg={mt.getPayload()} msgClock={mt.getClock()} sender={mt.getSender()} to={mt.getTo()}")
+    self._log("SEND", f"sendTo -> P{to} payload={mt.getPayload()} clock={mt.getClock()}")
     PyBus.Instance().post(mt)
     
   # --------------------------------------------------------------
@@ -139,8 +149,8 @@ class Com:
     self.broadcast({"type": "REGISTER", "name": self.owner_name, "clock": my_reg_clock})
     self._register_records.append((my_reg_clock, self.owner_name))
 
-    print(f"[{self.owner_name}][REGISTER] annoncé {self.owner_name}, attente de {self.npProcess} participants...")
-
+    self._log("REGISTER", f"j'annonce {self.owner_name}, attente de {self.npProcess} processus...")
+    
     # Attente des autres REGISTER
     while len(self.participants) < self.npProcess:
       self.register_event.wait(timeout=0.2)  # reveil périodique pour vérifier la condition
@@ -151,7 +161,7 @@ class Com:
     self.name_to_id = {name: idx for idx, name in enumerate(sorted_names)}
     self.myId = sorted_names.index(self.owner_name)
 
-    print(f"[{self.owner_name}][REGISTER] ordre d'arrivée={sorted_names} -> myID={self.myId}")
+    self._log("REGISTER", f"ordre d'arrivée={sorted_names} -> mon ID={self.myId}")
     
     return self.myId
   
@@ -173,8 +183,8 @@ class Com:
         msg_clock = payload.get("clock", event.getClock())
         self._register_records.append((msg_clock, name))
 
-      print(f"[{self.owner_name}][REGISTER] reçu de {name} ({len(self.participants)}/{self.npProcess})")
-
+      self._log("REGISTER", f"REGISTER reçu de {name} ({len(self.participants)}/{self.npProcess})")
+      
       if self.npProcess is not None and len(self.participants) >= self.npProcess:
         self.register_event.set()  # reveille la boucle d'attente
       return
@@ -182,10 +192,10 @@ class Com:
     # Gestion des REQUEST (SC)
     if isinstance(payload, dict) and payload.get("type") == "REQUEST":
       requester = payload["from"]
-      print(f"[{self.owner_name}][REQUEST-RECV] reçu REQUEST de P{requester}")
+      self._log("SC", f"REQUEST reçu de P{requester}")
       if self.holding_token and not self.waiting:
         # Je n'attends pas, je passe le token au demandeur
-        print(f"[{self.owner_name}][REQUEST-RELAY] je passe le token à P{requester}")
+        self._log("TOKEN", f"je passe le token à P{requester}")
         self.holding_token = False
         self.sendToken(requester)
       return
@@ -193,22 +203,22 @@ class Com:
     # Gestion des SYNC
     if isinstance(payload, dict) and payload.get("type") == "SYNC":
       self._sync_received.add(event.getSender())
-      print(f"[{self.owner_name}][COM-SYNC-RECV] reçu SYNC de {event.getSender()} ({len(self._sync_received)}/{self.npProcess})")
+      self._log("SYNC", f"reçu SYNC de {event.getSender()} ({len(self._sync_received)}/{self.npProcess})")
       if len(self._sync_received) >= self.npProcess:
         self._sync_event.set()  # reveille la boucle d'attente
       return
     
     # Gestion des SYNC-BROADCAST
     if isinstance(payload, dict) and payload.get("type") == "SYNC-BROADCAST":
-      print(f"[{self.owner_name}][COM-SYNC-BROADCAST-RECV] reçu SYNC-BROADCAST de {event.getSender()} -> msg={payload['data']}")
+      self._log("SYNC-BROADCAST", f"réception de {event.getSender()} -> {payload['data']}")
       # Répondre par un ACK
       to_id = self.name_to_id.get(event.getSender(), event.getSender())
       ack = MessageTo({"type": "ACK-SYNC-BROADCAST"}, self.incrementClock(), self.owner_name, to_id)
       PyBus.Instance().post(ack)
-      print(f"[{self.owner_name}][COM-SYNC-ACK-SEND] envoyé ACK à {event.getSender()}")
+      self._log("SYNC-BROADCAST", f"ACK envoyé à {event.getSender()}")
       return
-    
-    print(f"[{self.owner_name}][COM-BROADCAST-RECV] reçu de {event.getSender()} msg={payload} msgClock={event.getClock()} -> localClock={updated})")
+
+    self._log("RECEIVE", f"broadcast reçu de {event.getSender()} payload={payload} clock={event.getClock()}")
     self.enqueue_incoming(event)
 
   @subscribe(threadMode=Mode.PARALLEL, onEvent=MessageTo)
@@ -219,17 +229,17 @@ class Com:
     payload = event.getPayload()
     if isinstance(payload, dict) and payload.get("type") == "ACK-SYNC-BROADCAST":
       if event.getSender() != self.owner_name: # j'ignore mes propres ACK
-        print(f"[{self.owner_name}][COM-SYNC-ACK-RECV] reçu ACK de {event.getSender()}")
+        self._log("SYNC-BROADCAST", f"ACK reçu de {event.getSender()}")
         self.handle_ack()
         return
     if isinstance(payload, dict) and payload.get("type") == "ACK-SYNC-TO":
       if event.getSender() != self.owner_name: # j'ignore mes propres ACK
-        print(f"[{self.owner_name}][COM-SYNC-TO-ACK-RECV] reçu ACK de {event.getSender()}")
+        self._log("SYNC-BROADCAST", f"ACK reçu de {event.getSender()}")
         self.handle_ack()
         return
 
     updated = self.update_on_receive(event.getClock())
-    print(f"[{self.owner_name}][COM-RECV-TO] reçu de {event.getSender()} to={event.getTo()} msg={payload} msgClock={event.getClock()} -> localClock={updated})")
+    self._log("RECEIVE", f"réception directe de {event.getSender()} -> P{event.getTo()} payload={payload} clock={event.getClock()} -> local={updated}")
     self.enqueue_incoming(event)
   
   # --------------------------------------------------------------
@@ -242,7 +252,7 @@ class Com:
     # Envoi de mon SYNC
     send_clock = self.incrementClock()
     bm = BroadcastMessage({"type": "SYNC"}, send_clock, self.owner_name)
-    print(f"[{self.owner_name}][COM-SYNC] envoi SYNC msgClock={send_clock}")
+    self._log("SYNC", f"j'envoi SYNC clock={send_clock}")
     PyBus.Instance().post(bm)
 
     # Préparer la barrière
@@ -252,8 +262,8 @@ class Com:
     # Bloque jusqu'à réception de tous les SYNC
     while not self._sync_event.wait(timeout=0.1):
       pass
-    print(f"[{self.owner_name}][COM-SYNC] Tous les SYNC reçus, barrière franchie")
-
+    self._log("SYNC", f"Tous les SYNC reçus, barrière franchie")
+    
     # Nettoyage des variables temporaires
     del self._sync_received
     del self._sync_event
@@ -271,7 +281,7 @@ class Com:
     if from_id == my_id:
       send_clock = self.incrementClock()
       bm = BroadcastMessage({"type": "SYNC-BROADCAST", "data": payload}, send_clock, self.owner_name)
-      print(f"[{self.owner_name}][COM-SYNC-BROADCAST] msg={payload} msgClock={send_clock}")
+      self._log("SYNC-BROADCAST", f"diffusion synchrone payload={payload} clock={send_clock}")
       PyBus.Instance().post(bm)
 
       # J'attends les ACK de tous les autres
@@ -282,8 +292,8 @@ class Com:
       # Bloque jusqu'à réception de tous les ACK
       while not self._acks_event.wait(timeout=0.1):
         pass
-      print(f"[{self.owner_name}][COM-SYNC-BROADCAST] Tous les ACK reçus, barrière franchie")
-
+      self._log("SYNC-BROADCAST", f"Tous les ACK reçus, barrière franchie")
+      
       # Nettoyage des variables temporaires
       del self._acks_received
       del self._acks_target
@@ -293,8 +303,8 @@ class Com:
   def sendToSync(self, payload, to, my_id: int):
     send_clock = self.incrementClock()
     mt = MessageTo(payload, send_clock, self.owner_name, to)
-    print(f"[{self.owner_name}][COM-SEND-TO-SYNC] msg={mt.getPayload()} msgClock={mt.getClock()} sender={mt.getSender()} to={to}")
-
+    self._log("SYNC-TO", f"envoi synchrone à P{to} payload={mt.getPayload()} clock={mt.getClock()}")
+    
     # Prépare un event pour attendre l'ACK
     self._acks_received = 0
     self._acks_target = 1  # un seul ACK attendu
@@ -307,8 +317,8 @@ class Com:
     # Bloque jusqu'à réception de l'ACK
     while not self._acks_event.wait(timeout=0.1):
       pass
-    print(f"[{self.owner_name}][COM-SEND-TO-SYNC] ACK reçu de P{to}")
-
+    self._log("SYNC-TO", f"ACK reçu de P{to}, envoi synchrone terminé")
+    
     # Nettoyage des variables temporaires
     del self._acks_received
     del self._acks_target
@@ -325,13 +335,13 @@ class Com:
         if isinstance(msg, MessageTo):
           sender = msg.getSender()
           if sender == f"P{from_id}" or sender == from_id:
-            print(f"[{self.owner_name}][COM-RECEIVE-FROM-SYNC] reçu de P{from_id} -> msg={msg.getPayload()}")
+            self._log("SYNC-TO", f"réception de P{from_id} -> msg={msg.getPayload()}")
             # Répondre par un ACK
             ack = MessageTo({"type": "ACK-SYNC-TO"}, self.incrementClock(), self.owner_name, from_id)
             PyBus.Instance().post(ack)
             return msg
     except Empty:
-      print(f"[{self.owner_name}][COM-RECEIVE-FROM-SYNC] timeout d'attente écoulé")
+      self._log("SYNC-TO", f"timeout d'attente écoulé")
       return None
   
   # Incrémente le compteur d'ACK reçus et débloque si tous reçus
@@ -347,18 +357,18 @@ class Com:
   # Demande l'entrée en section critique (bloque jusqu'à obtention du token)
   def requestSC(self):
     self.waiting = True
-    print(f"[{self.owner_name}][REQUEST] J'attends le token...")
+    self._log("SC-REQUEST", f"Demande de SC, j'attends le token...")
     # Annonce aux autres que je veux entrer en SC (optionnel)
     self.broadcast({"type": "REQUEST", "from": self.myId})
     self.token_event.wait()  # bloque jusqu'à obtention du token
     self.token_event.clear()  # réinitialise l'event pour la prochaine fois
-    print(f"[{self.owner_name}][ENTER] J'ai le token, j'entre en SC")
-  
+    self._log("SC-ENTER", f"J'ai le token, j'entre en SC")
+    
   # Libère le token et le passe au suivant
   def releaseSC(self):
     if not self.holding_token:
       return
-    print(f"[{self.owner_name}][EXIT] Je quitte la SC et passe le token au suivant")
+    self._log("SC-EXIT", f"Je quitte la SC et passe le token au suivant")
     self.waiting = False
     self.holding_token = False
     self.sendToken(self.nextId()) # passage explicite après la SC
@@ -382,33 +392,53 @@ class Com:
     if event.getTo() != self.myId:
       return
     
-    local = self.getClock()
-    print(f"[{self.owner_name}][TOKEN-RECV] from={event.getSender()} waiting={self.waiting} -> localClock={local}")
+    # Ne décide plus ici : délègue au thread de gestion du token
+    self._token_q.put(event)
 
-    if not self.alive:
-      return
+  # Thread de gestion du token : réception, conservation, passage au suivant
+  def _token_loop(self):
+    while self._token_thread_alive:
+      try:
+        ev = self._token_q.get(timeout=0.2)
+      except Empty:
+        continue
+      if not self.alive:
+        continue
 
-    if self.waiting:
-      # Garde le jeton pour la SC
-      self.holding_token = True
-      self.token_event.set()  # pour reveiller request
-      print(f"[{self.owner_name}][TOKEN-HELD] je garde le jeton pour la SC")
-    else:
-      # Je n'attends pas, je garde le jeton en réserve
-      self.holding_token = True
-      print(f"[{self.owner_name}][TOKEN-RELAY] je garde le jeton en réserve")
+      local = self.getClock()
+      self._log("TOKEN", f"Token reçu de {ev.getSender()} -> waiting={self.waiting} -> localClock={local}")
+      
+      # Si on attend la SC : on garde le token et on réveille requestSC()
+      if self.waiting:
+        self.holding_token = True
+        self.token_event.set()  # réveille requestSC()
+        self._log("TOKEN", f"Je garde le token pour entrer en SC")
+      else:
+        # Pas en attente, on garde le token en réserve
+        self.holding_token = True
+        self._log("TOKEN", f"Je garde le token en réserve")
+        
+
 
   # Arrête proprement le communicateur
   def stop(self):
     self.alive = False
-    try:
-      self.com.stop()
-    except Exception:
-      pass
+    self._log("STOP", f"Arrêt du communicateur...")
 
     # Débloque une éventuelle attente du token
     try:
       self.token_event.set()
+    except Exception:
+      pass
+
+    # Arrête le thread de gestion du token
+    self._token_thread_alive = False
+    try:
+      self._token_q.put_nowait(None)
+    except Exception:
+      pass
+    try:
+      self._token_thread.join(timeout=1.0)
     except Exception:
       pass
 
@@ -438,4 +468,4 @@ class Com:
     except Exception:
       pass
 
-      
+    self._log("STOP", f"Communicateur arrêté.")

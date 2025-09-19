@@ -35,6 +35,9 @@ class Process(Thread):
 
         # Démarrage du thread
         self.start()
+
+    def _log(self, category: str, msg: str):
+        print(f"[PROCESS][{self.getName()}][{category}] {msg}")
     
     # --------------------------------------------------------------
     # Wrapers vers Com
@@ -67,7 +70,7 @@ class Process(Thread):
     @subscribe(threadMode = Mode.PARALLEL, onEvent=Message)
     def process(self, event):
         updated = self.updateClockOnReceive(event.getClock())
-        print(f"[{self.getName()}][RECV] from={event.getSender()} msg={event.getPayload()} msgClock={event.getClock()} -> localClock={updated} (thread={threading.current_thread().name})")
+        self._log("RECEIVE", f"de={event.getSender()} payload={event.getPayload()} msgClock={event.getClock()} -> localClock={updated} (thread={threading.current_thread().name})")
         self.com.enqueue_incoming(event)
 
     #--------------------------------------------------------------
@@ -80,7 +83,7 @@ class Process(Thread):
 
             # Horloge locale
             local_clock = self.incrementClock()
-            print(f"[{self.getName()}][LOOP {loop}] localClock={local_clock}")
+            self._log("LOOP", f"itération={loop} horloge={local_clock}")
 
             for _ in range(10):
                 if not self.alive:
@@ -97,7 +100,7 @@ class Process(Thread):
                         sleep(0.2)
                         with Process._token_lock:
                             if not Process._token_started:
-                                print(f"[{self.getName()}] Initial token launch -> P0")
+                                self._log("TOKEN", f"Lancement initial du token -> P0")
                                 self.com.sendToken(to_id=0)
                                 Process._token_started = True
                     Thread(target=_delayed_start, daemon=True).start()
@@ -110,16 +113,16 @@ class Process(Thread):
             
             # Exemple de test SendToSync / ReceiveFromSync
             if self.myProcessName == "P0" and loop == 3:
-                print(f"[{self.getName()}] TEST sendToSync vers P1")
+                self._log("TEST-SYNC-TO", f"test sendToSync vers P1")
                 self.com.sendToSync({"type": "test-sync", "text": "Hello P1, synchro!"}, to=1, my_id=self.myId)
 
             if self.myProcessName == "P1" and loop == 3:
-                print(f"[{self.getName()}] TEST receiveFromSync de P0")
+                self._log("TEST-SYNC-FROM", f"test receiveFromSync de P0")
                 msg = self.com.receiveFromSync(from_id=0, timeout=5)
                 if msg:
-                    print(f"... -> {msg.getPayload()}")
+                    self._log("TEST-SYNC-FROM", f"reçu de P0 -> {msg.getPayload()}")
                 else:
-                    print(f"[{self.getName()}] Rien reçu de P0 (timeout)")
+                    self._log("TEST-SYNC-FROM", f"timeout en attente de P0")
 
             # Envoi de messages par P1
             if self.myProcessName == "P1":
@@ -147,7 +150,7 @@ class Process(Thread):
 
         
             loop+=1
-        print(self.getName() + " stopped")
+        self._log("STOP", "Arrêt du processus")
 
     def stop(self):
         self.alive = False
