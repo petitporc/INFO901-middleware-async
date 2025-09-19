@@ -9,6 +9,8 @@ from MessageTo import MessageTo
 from TokenMessage import TokenMessage
 from BroadcastMessage import BroadcastMessage
 
+HEARTBEAT_INTERVAL = 0.5  # période d'émission du "battement de cœur" (heartbeat)
+HEARTBEAT_TIMEOUT = 2.0   # délai max sans heartbeat avant de considérer le processus comme mort
 
 class Com:
   """
@@ -69,6 +71,10 @@ class Com:
     self._register_seen = set()      # évite doublons
     self.register_event = Event()    # pour réveiller register() quand tous sont reçus
 
+    self.name_to_id = {}             # évite AttributeError
+    self._register_complete = False  # REGISTER pas encore terminé
+    self._pending_views = []         # VIEW reçues trop tôt (avant fin REGISTER)
+
     # Inscription sur le bus d’événements
     PyBus.Instance().register(self, self)
 
@@ -77,6 +83,17 @@ class Com:
     self._token_thread_alive = True
     self._token_thread = Thread(target=self._token_loop, daemon=True)
     self._token_thread.start()
+
+    # Heartbeat / vue distribuée
+    self.last_seen = {self.owner_name: time.time()} # name -> timestamp du dernier heartbeat reçu
+    self.alive_names = {self.owner_name} # sera complétée par REGISTER
+    self.view_version = 0 # incrémentée à chaque changement local
+
+    # Threads heartbeats
+    self._hb_sender_alive = False
+    self._hb_monitor_alive = False
+    self._hb_sender_thread = None
+    self._hb_monitor_thread = None
 
   # ---------------------------------------------------------------------------
   # Logger uniforme (FR)
@@ -116,6 +133,14 @@ class Com:
     with self._clock_lock:
       return self._clock
 
+  def getMyId(self) -> int | None:
+    """
+    Retourne l’ID de ce processus (après REGISTER).
+
+    :return: ID entier (0..npProcess-1) ou None si pas encore enregistré
+    """
+    return self.myId
+
   def update_on_receive(self, received_clock: int) -> int:
     """
     Met à jour l’horloge locale à la réception d’un message *utilisateur*.
@@ -139,7 +164,7 @@ class Com:
     send_clock = self.incrementClock()
     m = Message(payload, send_clock, self.owner_name)
     self._log("SEND", f"publish payload={m.getPayload()} clock={m.getClock()}")
-    PyBus.Instance().post(m)
+    self._safe_post(m, label="PUBLISH")
 
   def broadcast(self, payload):
     """
@@ -150,7 +175,7 @@ class Com:
     send_clock = self.incrementClock()
     bm = BroadcastMessage(payload, send_clock, self.owner_name)
     self._log("SEND", f"broadcast payload={bm.getPayload()} clock={bm.getClock()}")
-    PyBus.Instance().post(bm)
+    self._safe_post(bm, label="BROADCAST")
 
   def sendTo(self, payload, to):
     """
@@ -161,7 +186,7 @@ class Com:
     send_clock = self.incrementClock()
     mt = MessageTo(payload, send_clock, self.owner_name, to)
     self._log("SEND", f"sendTo -> P{to} payload={mt.getPayload()} clock={mt.getClock()}")
-    PyBus.Instance().post(mt)
+    self._safe_post(mt, label="SENDTO")
 
   # ---------------------------------------------------------------------------
   # Réception / Boîte aux lettres (BAL)
@@ -224,6 +249,12 @@ class Com:
     sorted_names = [name for _, name in ordered]
     self.name_to_id = {name: idx for idx, name in enumerate(sorted_names)}
     self.myId = sorted_names.index(self.owner_name)
+    self.alive_names = set(sorted_names)
+    self._register_complete = True
+    #self._start_heartbeats() # démarrage des threads de heartbeats après REGISTER
+    for pv in self._pending_views:
+      self._adopt_view(pv["alive"], pv["version"], pv["sender"])
+    self._pending_views.clear()
 
     self._log("REGISTER", f"ordre d'arrivée={sorted_names} -> mon ID={self.myId}")
     return self.myId
@@ -241,7 +272,7 @@ class Com:
     if event.getSender() == self.owner_name:
       return  # j'ignore mes propres broadcasts
 
-    updated = self.update_on_receive(event.getClock())
+    #updated = self.update_on_receive(event.getClock())
     payload = event.getPayload()
 
     # REGISTER
@@ -270,6 +301,9 @@ class Com:
 
     # SYNC (barrière)
     if isinstance(payload, dict) and payload.get("type") == "SYNC":
+      if not hasattr(self, "_sync_received") or self._sync_received is None:
+        self._sync_received = {self.owner_name}
+        self._sync_event = Event()
       self._sync_received.add(event.getSender())
       self._log("SYNC", f"reçu SYNC de {event.getSender()} ({len(self._sync_received)}/{self.npProcess})")
       if len(self._sync_received) >= self.npProcess:
@@ -278,12 +312,28 @@ class Com:
 
     # SYNC-BROADCAST (synchro avec ACK)
     if isinstance(payload, dict) and payload.get("type") == "SYNC-BROADCAST":
+      if not self._register_complete or not self.name_to_id:
+        return
       self._log("SYNC-BROADCAST", f"réception de {event.getSender()} -> {payload['data']}")
       # Répond par un ACK (destinataire = ID du sender)
       to_id = self.name_to_id.get(event.getSender(), event.getSender())
       ack = MessageTo({"type": "ACK-SYNC-BROADCAST"}, self.incrementClock(), self.owner_name, to_id)
-      PyBus.Instance().post(ack)
+      self._safe_post(ack, label="ACK-BROADCAST-SYNC")
       self._log("SYNC-BROADCAST", f"ACK envoyé à {event.getSender()}")
+      return
+    
+    # HEARTBEAT
+    if isinstance(payload, dict) and payload.get("type") == "HEARTBEAT":
+      sender = payload.get("name", event.getSender())
+      self.last_seen[sender] = time.time()
+      self._log("HEARTBEAT", f"heartbeat reçu de {sender}")
+      return
+
+    # VIEW (convergence de vue)
+    if isinstance(payload, dict) and payload.get("type") in ("VIEW", "VIEW-CHANGE"):
+      version = payload.get("version", 0)
+      alive_list = payload.get("alive", [])
+      self._adopt_view(alive_list, version, event.getSender())
       return
 
     # Par défaut : message utilisateur broadcast -> BAL
@@ -334,15 +384,15 @@ class Com:
     Implémentation : envoie un SYNC (broadcast), attend d’en recevoir un de chaque participant,
     puis débloque l’attente locale.
     """
+    # Prépare la barrière avant l'envoi de SYNC
+    self._sync_received = {self.owner_name}
+    self._sync_event = Event()
+
     # Envoi de mon SYNC
     send_clock = self.incrementClock()
     bm = BroadcastMessage({"type": "SYNC"}, send_clock, self.owner_name)
     self._log("SYNC", f"j'envoi SYNC clock={send_clock}")
-    PyBus.Instance().post(bm)
-
-    # Prépare la barrière
-    self._sync_received = {self.owner_name}
-    self._sync_event = Event()
+    self._safe_post(bm, label="SYNC")
 
     # Bloque jusqu’à réception de tous les SYNC
     while not self._sync_event.wait(timeout=0.1):
@@ -366,7 +416,7 @@ class Com:
       send_clock = self.incrementClock()
       bm = BroadcastMessage({"type": "SYNC-BROADCAST", "data": payload}, send_clock, self.owner_name)
       self._log("SYNC-BROADCAST", f"diffusion synchrone payload={payload} clock={send_clock}")
-      PyBus.Instance().post(bm)
+      self._safe_post(bm, label="SYNC-BROADCAST")
 
       # Attente des ACK de tous les autres
       self._acks_received = 0
@@ -397,7 +447,7 @@ class Com:
     self._acks_event = Event()
     self._acks_from = to
 
-    PyBus.Instance().post(mt)
+    self._safe_post(mt, label="SYNC-TO")
 
     while not self._acks_event.wait(timeout=0.1):
       pass
@@ -428,7 +478,7 @@ class Com:
             self._log("SYNC-TO", f"réception de P{from_id} -> msg={msg.getPayload()}")
             # Envoi ACK retour
             ack = MessageTo({"type": "ACK-SYNC-TO"}, self.incrementClock(), self.owner_name, from_id)
-            PyBus.Instance().post(ack)
+            self._safe_post(ack, label="ACK-SYNC-TO")
             return msg
     except Empty:
       self._log("SYNC-TO", "timeout d'attente écoulé")
@@ -480,7 +530,7 @@ class Com:
     send_clock = self.getClock()  # pas d’incrément ici !
     tm = TokenMessage(send_clock, self.owner_name, to_id)
     print(f"[{self.owner_name}][TOKEN-SEND] to=P{to_id} clock={tm.getClock()} sender={tm.getSender()}")
-    PyBus.Instance().post(tm)
+    self._safe_post(tm, label="TOKEN-SEND")
 
   def nextId(self):
     """
@@ -529,6 +579,119 @@ class Com:
         self._log("TOKEN", "Je garde le token en réserve")
 
   # ---------------------------------------------------------------------------
+  # Heartbeat / vue distribuée
+  # ---------------------------------------------------------------------------
+  def _start_heartbeats(self):
+    if self._hb_sender_alive: # déjà démarrés
+      return
+    self._hb_sender_alive = True
+    self._hb_monitor_alive = True
+    self._hb_sender_thread = Thread(target=self._hb_sender_loop, daemon=True)
+    self._hb_monitor_thread = Thread(target=self._hb_monitor_loop, daemon=True)
+    self._hb_sender_thread.start()
+    self._hb_monitor_thread.start()
+
+  def _recompute_ids_from_alive(self, alive_names: set):
+    """
+    Recalcule la numérotation (name -> Id et myId) à partir de la liste des noms vivants,
+    en respectant l’ordre d’arrivée initial (REGISTER).
+    """
+    # On garde uniquement les noms vivants dans le même ordre que lors du REGISTER
+    ordered = sorted(self._register_records, key=lambda t: (t[0], t[1]))
+    filtered_names = [name for _, name in ordered if name in alive_names]
+
+    self.name_to_id = {name: idx for idx, name in enumerate(filtered_names)}
+    old_myId = self.myId
+    self.myId = self.name_to_id.get(self.owner_name, None)
+
+    self._log("VIEW", f"vue recalculée des vivants={filtered_names} -> mon ID={self.myId} (ancien={old_myId})")
+
+  def _adopt_view(self, alive_list, version, sender):
+    """
+    Adopte la vue distribuée (liste 'vivants' + version) si:
+    - REGISTER est terminé
+    - la version est strictement plus récente
+    Sinon, la vue est mise en file d'attente
+    """
+    if not self._register_complete:
+      self._pending_views.append({"alive": alive_list, "version": version, "sender": sender})
+      return
+    
+    # Accepter seulement si version plus récente
+    if (version, sender) <= (self.view_version, self.owner_name):
+      return
+    
+    self.alive_names = set(alive_list)
+    self.view_version = version
+    self._recompute_ids_from_alive(self.alive_names)
+
+    self._log("VIEW", f"adoption vue v={version} de {sender} -> vivants={alive_list}")
+
+  def _hb_sender_loop(self):
+    """
+    Émet périodiquement un heartbeat (n'affecte pas l'horloge).
+    """
+    while self._hb_sender_alive and self.alive:
+      # broadcast heartbeat
+      hb = BroadcastMessage({"type": "HEARTBEAT", "name": self.owner_name}, self.getClock(), self.owner_name)
+      self._safe_post(hb, label="HEARTBEAT")
+      time.sleep(HEARTBEAT_INTERVAL)
+  
+  def _hb_monitor_loop(self):
+    """
+    Surveille les heartbeats reçus et détecte les processus morts, si c'est le cas :
+    On calcule une nouvelle vue des vivants et on recalcule les IDs.
+    """
+    while self._hb_monitor_alive and self.alive:
+      now = time.time()
+
+      # On part de tous ceux qu'on a vus au moins une fois
+      known = set(self.last_seen.keys()) | self.participants | set([self.owner_name])
+
+      # Vivants = last_seen récent
+      alive = set()
+      for name in known:
+        ts = self.last_seen.get(name, None)
+        if name == self.owner_name or (ts is not None and (now - ts) <= HEARTBEAT_TIMEOUT):
+          alive.add(name)
+      
+      # Si la vue change -> renumérotation + VIEW++
+      if (self._register_complete and alive != self.alive_names and len(self._register_records) >= self.npProcess):
+        # Toujours s'assurer que Je suis présent dans ma vue locale
+        alive.add(self.owner_name)
+        self.alive_names = set(alive)
+        self._recompute_ids_from_alive(self.alive_names)
+
+        # Diffuser la nouvelle vue pour faire converger les autres
+        self.view_version += 1
+        payload = {
+          "type": "VIEW-CHANGE",
+          "version": self.view_version,
+          "alive": sorted(list(self.alive_names)),
+        }
+        bm = BroadcastMessage(payload, self.getClock(), self.owner_name)
+        self._safe_post(bm, label="VIEW-CHANGE")
+        self._log("VIEW", f"vue changée, version={self.view_version} -> {payload['alive']}")
+      
+      time.sleep(HEARTBEAT_INTERVAL)
+  
+  # ---------------------------------------------------------------------------
+  # Sécurité
+  # ---------------------------------------------------------------------------
+  def _safe_post(self, event, label=""):
+    last_error = None
+    for _ in range(5):
+      try:
+        PyBus.Instance().post(event)
+        return
+      except RuntimeError as e:
+        last_error = e
+        time.sleep(0.1)
+        continue
+    
+    self._log("ERROR", f"Impossible de poster ({label}) : {last_error}")
+
+  # ---------------------------------------------------------------------------
   # Arrêt propre
   # ---------------------------------------------------------------------------
   def stop(self):
@@ -575,6 +738,18 @@ class Com:
     # Débloque une éventuelle get() bloquante si elle était utilisée sans timeout
     try:
       self._mailbox.put_nowait(None)
+    except Exception:
+      pass
+
+    # Arrête les threads heartbeat
+    self._hb_sender_alive = False
+    self._hb_monitor_alive = False
+    try:
+      self._hb_sender_thread.join(timeout=1.0)
+    except Exception:
+      pass
+    try:
+      self._hb_monitor_thread.join(timeout=1.0)
     except Exception:
       pass
 
