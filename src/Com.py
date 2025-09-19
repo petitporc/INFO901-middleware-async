@@ -378,6 +378,18 @@ class Com:
     )
     self.enqueue_incoming(event)
 
+  @subscribe(threadMode=Mode.PARALLEL, onEvent=Message)
+  def onMessage(self, event):
+    """
+    Handler d’evénements publish (Message générique)
+    Se contente de relayer vers la BAL.
+    """
+    if not self.alive:
+      return
+    updated = self.update_on_receive(event.getClock())
+    self._log("RECEIVE", f"publish reçu de {event.getSender()} payload={event.getPayload()} clock={event.getClock()} -> localClock={updated}")
+    self.enqueue_incoming(event)
+
   # ---------------------------------------------------------------------------
   # Barrière de synchronisation
   # ---------------------------------------------------------------------------

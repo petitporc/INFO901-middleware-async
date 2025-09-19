@@ -8,8 +8,6 @@ from MessageTo import MessageTo
 from TokenMessage import TokenMessage
 from Com import Com
 
-from pyeventbus3.pyeventbus3 import *
-
 
 class Process(Thread):
     _token_started = False
@@ -61,16 +59,6 @@ class Process(Thread):
     # Ajout de sendTo
     def sendTo(self, payload, to):
         self.com.sendTo(payload, to)
-
-    # --------------------------------------------------------------
-    # Abonnement aux événements
-    # --------------------------------------------------------------
-
-    @subscribe(threadMode = Mode.PARALLEL, onEvent=Message)
-    def process(self, event):
-        updated = self.updateClockOnReceive(event.getClock())
-        self._log("RECEIVE", f"de={event.getSender()} payload={event.getPayload()} msgClock={event.getClock()} -> localClock={updated} (thread={threading.current_thread().name})")
-        self.com.enqueue_incoming(event)
 
     #--------------------------------------------------------------
     # Boucle principale
